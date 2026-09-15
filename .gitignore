@@ -1,0 +1,28 @@
+.DS_Store
+.posit/
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local and generated data
+data/raw/*
+data/interim/*
+data/processed/*
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+
+# Model artifacts and analytical outputs
+models/*
+outputs/*
+!models/.gitkeep
+!outputs/predictions/
+!outputs/decision-tables/
+!outputs/predictions/.gitkeep
+!outputs/decision-tables/.gitkeep
+
+# Rendered Quarto artifacts
+reports/_build/
+*_files/
+*.html
