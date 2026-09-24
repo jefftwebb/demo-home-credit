@@ -23,6 +23,8 @@ outputs/*
 !outputs/decision-tables/.gitkeep
 
 # Rendered Quarto artifacts
+.quarto/
+*.quarto_ipynb
 reports/_build/
 *_files/
 *.html

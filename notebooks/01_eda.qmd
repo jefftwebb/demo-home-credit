@@ -1,0 +1,851 @@
+---
+title: "Application training data: exploratory analysis"
+subtitle: "Home Credit repayment risk"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    embed-resources: true
+    fig-align: center
+jupyter: python3
+execute:
+  echo: true
+  warning: false
+  error: false
+  cache: false
+---
+
+## Scope
+
+This notebook executes the approved EDA plan for `application_train.csv`. It
+describes the labeled application sample, checks data quality and decision-time
+availability, and measures descriptive associations with payment difficulty.
+It does not select a production model, estimate causal effects, or recommend an
+approval cutoff.
+
+The raw CSV remains unchanged. Derived fields exist only in notebook memory.
+
+```{python}
+#| label: setup
+#| include: false
+from pathlib import Path
+import hashlib
+import itertools
+import math
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import display, Markdown
+from scipy.stats import chi2_contingency
+from sklearn.model_selection import train_test_split
+
+pd.set_option("display.max_columns", 30)
+pd.set_option("display.max_rows", 30)
+pd.set_option("display.width", 140)
+
+sns.set_theme(style="whitegrid", context="notebook")
+BLUE = "#2F5597"
+ORANGE = "#C55A11"
+GRAY = "#6B7280"
+RED = "#B91C1C"
+
+path_candidates = [
+    Path("../data/raw/application_train.csv"),
+    Path("data/raw/application_train.csv"),
+]
+DATA_PATH = next(path.resolve() for path in path_candidates if path.exists())
+train = pd.read_csv(DATA_PATH)
+PORTFOLIO_RATE = float(train["TARGET"].mean())
+
+def wilson_interval(bad, n, z=1.96):
+    if n == 0:
+        return (np.nan, np.nan)
+    p = bad / n
+    denom = 1 + z**2 / n
+    center = (p + z**2 / (2*n)) / denom
+    half = z * math.sqrt((p*(1-p) + z**2/(4*n)) / n) / denom
+    return center - half, center + half
+
+def risk_summary(group, target=train["TARGET"], min_n=1):
+    labels = pd.Series(group, index=target.index).astype("object")
+    labels = labels.where(labels.notna(), "Missing")
+    work = pd.DataFrame({"group": labels, "TARGET": target})
+    out = work.groupby("group", dropna=False, sort=False)["TARGET"].agg(
+        n="size", bad="sum", event_rate="mean"
+    ).reset_index()
+    intervals = [wilson_interval(int(row.bad), int(row.n)) for row in out.itertuples()]
+    out["ci_low"] = [x[0] for x in intervals]
+    out["ci_high"] = [x[1] for x in intervals]
+    out["pp_vs_portfolio"] = 100 * (out["event_rate"] - PORTFOLIO_RATE)
+    out["lift"] = out["event_rate"] / PORTFOLIO_RATE
+    out["population_share"] = out["n"] / len(target)
+    return out.loc[out["n"] >= min_n].reset_index(drop=True)
+
+def quantile_groups(series, q=10, prefix="Q"):
+    result = pd.Series("Missing", index=series.index, dtype="object")
+    observed = series.dropna()
+    if observed.empty:
+        return result
+    ranked = pd.qcut(observed, q=q, duplicates="drop")
+    result.loc[observed.index] = ranked.astype(str)
+    return result
+
+def rounded(frame, digits=4):
+    result = frame.copy()
+    numeric = result.select_dtypes(include="number").columns
+    result[numeric] = result[numeric].round(digits)
+    return result
+
+def compact_risk(frame):
+    cols = ["group", "n", "bad", "population_share", "event_rate",
+            "ci_low", "ci_high", "pp_vs_portfolio", "lift"]
+    return rounded(frame[cols], 4)
+```
+
+## Standing checks
+
+### Q1. Grain, key, schema, and duplicates
+
+```{python}
+#| label: q1-data-contract
+target_values = sorted(train["TARGET"].dropna().unique().tolist())
+contract = pd.DataFrame({
+    "check": [
+        "Rows", "Columns", "SK_ID_CURR missing", "SK_ID_CURR unique",
+        "Duplicate rows", "TARGET missing", "TARGET values"
+    ],
+    "observed": [
+        f"{len(train):,}", f"{train.shape[1]:,}",
+        f"{train['SK_ID_CURR'].isna().sum():,}",
+        f"{train['SK_ID_CURR'].nunique():,}",
+        f"{train.duplicated().sum():,}",
+        f"{train['TARGET'].isna().sum():,}", str(target_values),
+    ],
+    "status": [
+        "Observed", "Observed",
+        "Pass" if train["SK_ID_CURR"].notna().all() else "Fail",
+        "Pass" if train["SK_ID_CURR"].is_unique else "Fail",
+        "Pass" if not train.duplicated().any() else "Fail",
+        "Pass" if train["TARGET"].notna().all() else "Fail",
+        "Pass" if target_values == [0, 1] else "Fail",
+    ]
+})
+display(contract)
+
+dtype_summary = (train.dtypes.astype(str).value_counts()
+                 .rename_axis("dtype").reset_index(name="columns"))
+display(dtype_summary)
+```
+
+The source has one complete, unique `SK_ID_CURR` per row, no duplicate rows,
+and a complete binary target.
+
+### Q2. Decision-time availability and leakage review
+
+```{python}
+#| label: q2-availability
+sensitive_audit = {"CODE_GENDER", "DAYS_BIRTH", "NAME_FAMILY_STATUS"}
+opaque_review = {"EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3",
+                 "REGION_RATING_CLIENT", "REGION_RATING_CLIENT_W_CITY"}
+proxy_review = {
+    "REGION_POPULATION_RELATIVE", "NAME_HOUSING_TYPE", "FLAG_OWN_REALTY",
+    "REG_REGION_NOT_LIVE_REGION", "REG_REGION_NOT_WORK_REGION",
+    "LIVE_REGION_NOT_WORK_REGION", "REG_CITY_NOT_LIVE_CITY",
+    "REG_CITY_NOT_WORK_CITY", "LIVE_CITY_NOT_WORK_CITY"
+}
+
+availability_rows = []
+for column in train.columns:
+    if column == "SK_ID_CURR":
+        classification, action = "Identifier", "Exclude from modeling"
+    elif column == "TARGET":
+        classification, action = "Outcome", "Use only as label"
+    elif column in sensitive_audit:
+        classification, action = "Sensitive or protected-basis audit", "Audit; policy review before use"
+    elif column in opaque_review:
+        classification, action = "Application-time candidate; meaning opaque", "Retain provisionally; document source"
+    elif column in proxy_review:
+        classification, action = "Application-time proxy", "Retain provisionally; fair-lending review"
+    else:
+        classification, action = "Application-time candidate", "Retain provisionally"
+    availability_rows.append((column, classification, action))
+
+availability = pd.DataFrame(
+    availability_rows, columns=["column", "classification", "proposed_action"]
+)
+display(availability["classification"].value_counts().rename_axis("classification")
+        .reset_index(name="columns"))
+display(availability.loc[availability["classification"] != "Application-time candidate"])
+```
+
+No predictor name directly describes later repayment performance. The external
+scores and regional measures remain provisional because their construction and
+timing are not documented in the CSV.
+
+### Q3. Target distribution
+
+```{python}
+#| label: q3-target
+#| fig-width: 7
+#| fig-height: 4
+target_summary = risk_summary(train["TARGET"].map({0: "No payment difficulty", 1: "Payment difficulty"}))
+target_counts = (train["TARGET"].value_counts().sort_index()
+                 .rename(index={0: "No payment difficulty", 1: "Payment difficulty"})
+                 .rename_axis("outcome").reset_index(name="n"))
+target_counts["share"] = target_counts["n"] / len(train)
+display(rounded(target_counts, 4))
+
+ax = sns.barplot(data=target_counts, x="outcome", y="share", color=BLUE)
+ax.set(title="Target distribution", xlabel="", ylabel="Share of applications", ylim=(0, 1))
+ax.yaxis.set_major_formatter(lambda x, pos: f"{x:.0%}")
+for patch, row in zip(ax.patches, target_counts.itertuples()):
+    ax.text(patch.get_x() + patch.get_width()/2, patch.get_height() + .02,
+            f"{row.n:,}\n{row.share:.1%}", ha="center", va="bottom")
+sns.despine()
+plt.show()
+```
+
+Payment difficulty occurs in 24,825 of 307,511 applications, or 8.07%.
+
+### Q4. Sample scope and limits
+
+| Observed scope | Consequence |
+|---|---|
+| Approved applications in the labeled sample | The data cannot directly estimate outcomes for applicants who were declined. |
+| Anonymized market and currency | Amounts support relative comparisons, not current-market profit estimates. |
+| Early payment difficulty label | `TARGET` is not a write-off or loss-severity measure. |
+| Observational application records | Associations do not identify causal effects of lending interventions. |
+| No sponsor cost assumptions | EDA cannot choose an economic approval threshold. |
+
+These limits constrain business conclusions even when descriptive patterns are
+stable in the sample.
+
+### Q5. Missingness by column and application
+
+```{python}
+#| label: q5-missingness
+#| fig-width: 8
+#| fig-height: 6
+missingness = pd.DataFrame({
+    "column": train.columns,
+    "missing_n": train.isna().sum().values,
+    "missing_share": train.isna().mean().values,
+}).sort_values(["missing_share", "column"], ascending=[False, True])
+display(rounded(missingness.head(25), 4))
+
+train["_MISSING_COUNT"] = train.isna().sum(axis=1)
+row_missing = train["_MISSING_COUNT"].describe(percentiles=[.1, .25, .5, .75, .9, .95, .99])
+display(row_missing.to_frame("missing_fields").round(2))
+
+plot_missing = missingness.loc[missingness["missing_share"] >= .05].head(30)
+fig, axes = plt.subplots(1, 2, figsize=(12, 7), gridspec_kw={"width_ratios": [1.5, 1]})
+sns.barplot(data=plot_missing, y="column", x="missing_share", color=BLUE, ax=axes[0])
+axes[0].set(title="Columns with at least 5% missing", xlabel="Missing share", ylabel="")
+axes[0].xaxis.set_major_formatter(lambda x, pos: f"{x:.0%}")
+sns.histplot(train["_MISSING_COUNT"], bins=30, color=ORANGE, ax=axes[1])
+axes[1].set(title="Missing fields per application", xlabel="Missing field count", ylabel="Applications")
+sns.despine()
+plt.tight_layout()
+plt.show()
+```
+
+Missingness is concentrated in property fields, car age, occupation, and external
+score fields rather than spread evenly across the schema.
+
+### Q6. Missingness and payment difficulty
+
+```{python}
+#| label: q6-missingness-risk
+#| fig-width: 9
+#| fig-height: 5
+missing_risk_rows = []
+for column in missingness.loc[missingness["missing_n"] > 0, "column"]:
+    is_missing = train[column].isna()
+    n_missing = int(is_missing.sum())
+    n_observed = int((~is_missing).sum())
+    bad_missing = int(train.loc[is_missing, "TARGET"].sum())
+    bad_observed = int(train.loc[~is_missing, "TARGET"].sum())
+    rate_missing = bad_missing / n_missing
+    rate_observed = bad_observed / n_observed
+    missing_risk_rows.append({
+        "column": column,
+        "missing_n": n_missing,
+        "missing_share": n_missing / len(train),
+        "missing_event_rate": rate_missing,
+        "observed_event_rate": rate_observed,
+        "pp_difference": 100 * (rate_missing - rate_observed),
+        "missing_lift": rate_missing / PORTFOLIO_RATE,
+    })
+missing_risk = pd.DataFrame(missing_risk_rows)
+missing_risk["abs_pp_difference"] = missing_risk["pp_difference"].abs()
+display(rounded(missing_risk.sort_values("abs_pp_difference", ascending=False).head(25), 4))
+
+missing_bands = pd.cut(
+    train["_MISSING_COUNT"], bins=[-1, 0, 5, 15, 30, 50, np.inf],
+    labels=["0", "1–5", "6–15", "16–30", "31–50", "51+"]
+)
+missing_band_risk = risk_summary(missing_bands)
+display(compact_risk(missing_band_risk))
+
+selected_missing = [c for c in [
+    "EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3", "OCCUPATION_TYPE",
+    "OWN_CAR_AGE", "APARTMENTS_AVG", "BASEMENTAREA_AVG", "YEARS_BUILD_AVG",
+    "COMMONAREA_AVG", "AMT_REQ_CREDIT_BUREAU_MON", "AMT_REQ_CREDIT_BUREAU_YEAR"
+] if c in train]
+co_missing = train[selected_missing].isna().corr()
+sns.heatmap(co_missing, cmap="vlag", center=0, vmin=-1, vmax=1, square=True,
+            cbar_kws={"label": "Missing-indicator correlation"})
+plt.title("Selected co-missingness patterns")
+plt.tight_layout()
+plt.show()
+```
+
+The outputs treat absence as a measurable state. They do not assume that missing
+values are random or prescribe imputation.
+
+### Q7. Impossible, sentinel-coded, and extreme values
+
+```{python}
+#| label: q7-validity
+rules = []
+def add_rule(rule, mask, treatment):
+    count = int(pd.Series(mask, index=train.index).fillna(False).sum())
+    rules.append({"rule": rule, "affected_n": count,
+                  "affected_share": count/len(train), "proposed_treatment": treatment})
+
+age_years = -train["DAYS_BIRTH"] / 365.25
+employed_years_raw = -train["DAYS_EMPLOYED"] / 365.25
+add_rule("DAYS_EMPLOYED equals 365243 sentinel", train["DAYS_EMPLOYED"].eq(365243), "Set tenure to missing; retain sentinel flag")
+add_rule("Age outside 18–100 years", ~age_years.between(18, 100), "Investigate; exclude invalid derived age")
+add_rule("Employment starts before age 14", (train["DAYS_EMPLOYED"] < 0) & (employed_years_raw > age_years - 14), "Investigate and set invalid tenure to missing")
+add_rule("Children exceed family members", train["CNT_CHILDREN"] > train["CNT_FAM_MEMBERS"], "Investigate")
+add_rule("Family members below 1", train["CNT_FAM_MEMBERS"] < 1, "Investigate")
+add_rule("Nonpositive income", train["AMT_INCOME_TOTAL"] <= 0, "Invalid denominator")
+add_rule("Nonpositive credit", train["AMT_CREDIT"] <= 0, "Investigate")
+add_rule("Nonpositive annuity", train["AMT_ANNUITY"] <= 0, "Invalid burden input")
+add_rule("Nonpositive goods price", train["AMT_GOODS_PRICE"] <= 0, "Invalid ratio denominator")
+add_rule("CODE_GENDER equals XNA", train["CODE_GENDER"].eq("XNA"), "Keep as undocumented audit category")
+add_rule("NAME_FAMILY_STATUS equals Unknown", train["NAME_FAMILY_STATUS"].eq("Unknown"), "Keep as undocumented category")
+add_rule("ORGANIZATION_TYPE equals XNA", train["ORGANIZATION_TYPE"].eq("XNA"), "Treat as unavailable organization type")
+
+normalized_cols = [c for c in train.select_dtypes(include="number") if
+                   c.startswith("EXT_SOURCE_") or c == "REGION_POPULATION_RELATIVE" or
+                   c.endswith(("_AVG", "_MODE", "_MEDI")) or c == "TOTALAREA_MODE"]
+normalized_bad = pd.Series(False, index=train.index)
+for column in normalized_cols:
+    normalized_bad |= train[column].notna() & ~train[column].between(0, 1)
+add_rule("Normalized numeric field outside 0–1", normalized_bad, "Investigate by field")
+
+binary_cols = [c for c in train.columns if c.startswith("FLAG_")] + [
+    "REG_REGION_NOT_LIVE_REGION", "REG_REGION_NOT_WORK_REGION", "LIVE_REGION_NOT_WORK_REGION",
+    "REG_CITY_NOT_LIVE_CITY", "REG_CITY_NOT_WORK_CITY", "LIVE_CITY_NOT_WORK_CITY"
+]
+binary_bad = sum((~train[c].dropna().isin([0, 1])).sum() for c in binary_cols)
+rules.append({"rule": "Nonbinary entries in declared binary fields", "affected_n": int(binary_bad),
+              "affected_share": binary_bad/len(train), "proposed_treatment": "Investigate by field"})
+
+validity = pd.DataFrame(rules).sort_values("affected_n", ascending=False)
+display(rounded(validity, 4))
+
+extreme_columns = ["AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY", "AMT_GOODS_PRICE",
+                   "DAYS_BIRTH", "DAYS_EMPLOYED", "CNT_CHILDREN", "CNT_FAM_MEMBERS"]
+extreme_quantiles = train[extreme_columns].quantile([0, .001, .01, .5, .99, .999, 1]).T
+extreme_quantiles.columns = ["min", "p0.1", "p1", "median", "p99", "p99.9", "max"]
+display(rounded(extreme_quantiles, 2))
+```
+
+The dominant invalid code is `DAYS_EMPLOYED = 365243`, which occurs with
+`ORGANIZATION_TYPE = XNA`; neither value is treated as genuine tenure or employer
+information.
+
+## Underwriting concepts and derived fields
+
+### Q8. Income and requested-loan amounts
+
+```{python}
+#| label: q8-amounts
+#| fig-width: 10
+#| fig-height: 7
+amount_cols = ["AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY", "AMT_GOODS_PRICE"]
+amount_quantiles = train[amount_cols].quantile([0, .01, .1, .5, .9, .99, .999, 1]).T
+amount_quantiles.columns = ["min", "p1", "p10", "median", "p90", "p99", "p99.9", "max"]
+display(rounded(amount_quantiles, 1))
+
+rounding = pd.DataFrame({
+    "column": amount_cols,
+    "share_divisible_by_1,000": [
+        (train[c].dropna().mod(1000).eq(0)).mean() for c in amount_cols
+    ],
+    "share_missing": [train[c].isna().mean() for c in amount_cols]
+})
+display(rounded(rounding, 4))
+
+fig, axes = plt.subplots(2, 2, figsize=(11, 7))
+for ax, column in zip(axes.flat, amount_cols):
+    values = np.log10(train[column].dropna().clip(lower=1))
+    sns.histplot(values, bins=50, color=BLUE, ax=ax)
+    ax.set(title=column, xlabel="log10(amount)", ylabel="Applications")
+sns.despine()
+plt.tight_layout()
+plt.show()
+```
+
+All four amount fields are strongly right-skewed; income contains a particularly
+large upper-tail value, so raw-scale means are not representative summaries.
+
+### Q9. Repayment-capacity ratios
+
+```{python}
+#| label: q9-ratios
+#| fig-width: 10
+#| fig-height: 4
+train["_ANNUAL_PAYMENT_TO_INCOME"] = np.where(
+    train["AMT_INCOME_TOTAL"] > 0,
+    12 * train["AMT_ANNUITY"] / train["AMT_INCOME_TOTAL"], np.nan
+)
+train["_PAYMENT_TO_INCOME_UNANNUALIZED"] = np.where(
+    train["AMT_INCOME_TOTAL"] > 0,
+    train["AMT_ANNUITY"] / train["AMT_INCOME_TOTAL"], np.nan
+)
+train["_CREDIT_TO_INCOME"] = np.where(
+    train["AMT_INCOME_TOTAL"] > 0,
+    train["AMT_CREDIT"] / train["AMT_INCOME_TOTAL"], np.nan
+)
+train["_CREDIT_TO_GOODS"] = np.where(
+    train["AMT_GOODS_PRICE"] > 0,
+    train["AMT_CREDIT"] / train["AMT_GOODS_PRICE"], np.nan
+)
+
+ratio_cols = ["_ANNUAL_PAYMENT_TO_INCOME", "_PAYMENT_TO_INCOME_UNANNUALIZED",
+              "_CREDIT_TO_INCOME", "_CREDIT_TO_GOODS"]
+ratio_summary = train[ratio_cols].describe(percentiles=[.01, .1, .5, .9, .99, .999]).T
+ratio_summary["missing_share"] = train[ratio_cols].isna().mean()
+display(rounded(ratio_summary, 4))
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.8))
+for ax, column in zip(axes, ["_ANNUAL_PAYMENT_TO_INCOME", "_CREDIT_TO_INCOME", "_CREDIT_TO_GOODS"]):
+    upper = train[column].quantile(.995)
+    sns.histplot(train[column].clip(upper=upper), bins=50, color=ORANGE, ax=ax)
+    ax.set(title=column.replace("_", " ").strip().title(), xlabel="Ratio, capped at p99.5", ylabel="Applications")
+sns.despine()
+plt.tight_layout()
+plt.show()
+```
+
+The annual payment-to-income measure assumes monthly annuity and annual income.
+The unannualized sensitivity field is retained because the source does not state
+those periods explicitly.
+
+### Q10. Age, employment, and registration tenure
+
+```{python}
+#| label: q10-tenures
+train["_AGE_YEARS"] = -train["DAYS_BIRTH"] / 365.25
+train["_EMPLOYED_SENTINEL"] = train["DAYS_EMPLOYED"].eq(365243)
+train["_EMPLOYED_YEARS"] = np.where(
+    train["DAYS_EMPLOYED"] < 0, -train["DAYS_EMPLOYED"] / 365.25, np.nan
+)
+train["_REGISTRATION_YEARS"] = np.where(
+    train["DAYS_REGISTRATION"] <= 0, -train["DAYS_REGISTRATION"] / 365.25, np.nan
+)
+train["_ID_PUBLISH_YEARS"] = np.where(
+    train["DAYS_ID_PUBLISH"] <= 0, -train["DAYS_ID_PUBLISH"] / 365.25, np.nan
+)
+
+tenure_cols = ["_AGE_YEARS", "_EMPLOYED_YEARS", "_REGISTRATION_YEARS", "_ID_PUBLISH_YEARS"]
+display(rounded(train[tenure_cols].describe(percentiles=[.01, .1, .5, .9, .99]).T, 2))
+
+sentinel_context = (train.groupby(["_EMPLOYED_SENTINEL", "NAME_INCOME_TYPE"], dropna=False)
+                    .agg(n=("TARGET", "size"), event_rate=("TARGET", "mean"))
+                    .reset_index().sort_values(["_EMPLOYED_SENTINEL", "n"], ascending=[False, False]))
+display(rounded(sentinel_context.head(20), 4))
+```
+
+The employment sentinel is concentrated in income categories without ordinary
+current employment, so it remains a distinct availability state.
+
+## Descriptive risk separation
+
+Every rate table below includes population, bad count, event rate, difference from
+the 8.07% portfolio rate, and lift. These are descriptive associations.
+
+### Q11. External scores
+
+```{python}
+#| label: q11-external-scores
+#| fig-width: 10
+#| fig-height: 4
+external_cols = ["EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"]
+external_coverage = pd.DataFrame({
+    "feature": external_cols,
+    "observed_n": [train[c].notna().sum() for c in external_cols],
+    "coverage": [train[c].notna().mean() for c in external_cols],
+    "observed_mean": [train[c].mean() for c in external_cols],
+    "observed_median": [train[c].median() for c in external_cols],
+})
+display(rounded(external_coverage, 4))
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.8), sharey=True)
+external_deciles = {}
+for ax, column in zip(axes, external_cols):
+    groups = quantile_groups(train[column], q=10)
+    table = risk_summary(groups)
+    observed = table.loc[table["group"] != "Missing"].copy()
+    external_deciles[column] = table
+    sns.lineplot(data=observed, x=np.arange(1, len(observed)+1), y="event_rate",
+                 marker="o", color=BLUE, ax=ax)
+    ax.axhline(PORTFOLIO_RATE, color=GRAY, linestyle="--", linewidth=1)
+    ax.set(title=column, xlabel="Score decile, low to high", ylabel="Event rate")
+    ax.yaxis.set_major_formatter(lambda x, pos: f"{x:.0%}")
+sns.despine()
+plt.tight_layout()
+plt.show()
+
+display(rounded(train[external_cols].corr(method="spearman"), 3))
+for column in external_cols:
+    display(Markdown(f"**{column} deciles and missing group**"))
+    display(compact_risk(external_deciles[column]))
+```
+
+Higher external scores correspond to lower observed payment-difficulty rates for
+all three fields, while coverage differs materially across the three sources.
+
+### Q12. Loan burden and amount features
+
+```{python}
+#| label: q12-burden-risk
+#| fig-width: 11
+#| fig-height: 7
+burden_features = {
+    "Income": "AMT_INCOME_TOTAL",
+    "Credit": "AMT_CREDIT",
+    "Annual payment / income": "_ANNUAL_PAYMENT_TO_INCOME",
+    "Credit / income": "_CREDIT_TO_INCOME",
+    "Credit / goods": "_CREDIT_TO_GOODS",
+}
+fig, axes = plt.subplots(2, 3, figsize=(12, 7), sharey=False)
+burden_tables = {}
+for ax, (label, column) in zip(axes.flat, burden_features.items()):
+    table = risk_summary(quantile_groups(train[column], q=10))
+    burden_tables[label] = table
+    observed = table.loc[table["group"] != "Missing"]
+    sns.lineplot(x=np.arange(1, len(observed)+1), y=observed["event_rate"],
+                 marker="o", color=ORANGE, ax=ax)
+    ax.axhline(PORTFOLIO_RATE, color=GRAY, linestyle="--", linewidth=1)
+    ax.set(title=label, xlabel="Quantile, low to high", ylabel="Event rate")
+    ax.yaxis.set_major_formatter(lambda x, pos: f"{x:.0%}")
+axes.flat[-1].axis("off")
+sns.despine()
+plt.tight_layout()
+plt.show()
+
+pti_quintile = quantile_groups(train["_ANNUAL_PAYMENT_TO_INCOME"], q=5)
+contract_pti = (pd.DataFrame({"contract": train["NAME_CONTRACT_TYPE"],
+                              "pti_group": pti_quintile, "TARGET": train["TARGET"]})
+                .groupby(["contract", "pti_group"], observed=False)
+                .agg(n=("TARGET", "size"), event_rate=("TARGET", "mean"))
+                .reset_index())
+display(rounded(contract_pti, 4))
+```
+
+The burden relationships are not interchangeable: requested amounts, income, and
+the three ratios show different shapes, and contract type changes the comparison.
+
+### Q13. Employment and income-stability proxies
+
+```{python}
+#| label: q13-employment-risk
+display(Markdown("**Income type**"))
+display(compact_risk(risk_summary(train["NAME_INCOME_TYPE"])
+                     .sort_values("event_rate", ascending=False)))
+
+display(Markdown("**Occupation type, groups with at least 500 applications**"))
+occupation_risk = risk_summary(train["OCCUPATION_TYPE"], min_n=500).sort_values("event_rate", ascending=False)
+display(compact_risk(occupation_risk))
+
+display(Markdown("**Organization type, groups with at least 1,000 applications**"))
+organization_risk = risk_summary(train["ORGANIZATION_TYPE"], min_n=1000).sort_values("event_rate", ascending=False)
+display(compact_risk(organization_risk))
+
+employment_risk = risk_summary(quantile_groups(train["_EMPLOYED_YEARS"], q=10))
+display(Markdown("**Valid employment tenure deciles and missing group**"))
+display(compact_risk(employment_risk))
+```
+
+Employment-related categories and tenure bands have different observed event rates,
+but the missing/sentinel state is also a large population segment.
+
+### Q14. Housing, household, region, and mobility
+
+```{python}
+#| label: q14-household-risk
+for label, column in [
+    ("Housing type", "NAME_HOUSING_TYPE"),
+    ("Owns realty", "FLAG_OWN_REALTY"),
+    ("Region rating", "REGION_RATING_CLIENT"),
+    ("City-adjusted region rating", "REGION_RATING_CLIENT_W_CITY"),
+]:
+    display(Markdown(f"**{label}**"))
+    display(compact_risk(risk_summary(train[column]).sort_values("event_rate", ascending=False)))
+
+property_cols = [c for c in train.columns if c.endswith(("_AVG", "_MODE", "_MEDI")) and
+                 train[c].dtype != "object"] + ["TOTALAREA_MODE"]
+train["_PROPERTY_MISSING_COUNT"] = train[property_cols].isna().sum(axis=1)
+property_missing_risk = risk_summary(quantile_groups(train["_PROPERTY_MISSING_COUNT"], q=5))
+display(Markdown("**Property-field missingness quintiles**"))
+display(compact_risk(property_missing_risk))
+
+household = pd.DataFrame({
+    "family_size_group": pd.cut(train["CNT_FAM_MEMBERS"],
+                                bins=[0, 1, 2, 3, 4, 5, np.inf],
+                                labels=["1", "2", "3", "4", "5", "6+"]),
+    "TARGET": train["TARGET"]
+})
+display(Markdown("**Family size**"))
+display(compact_risk(risk_summary(household["family_size_group"])))
+```
+
+Property coverage, housing type, household size, and regional ratings each divide
+the sample into groups with different event rates; property availability is itself
+part of the pattern.
+
+### Q15. Inquiries, application timing, contact, and document flags
+
+```{python}
+#| label: q15-operational-signals
+#| fig-width: 10
+#| fig-height: 6
+inquiry_cols = [c for c in train.columns if c.startswith("AMT_REQ_CREDIT_BUREAU_")]
+inquiry_outputs = []
+for column in inquiry_cols:
+    values = train[column]
+    bucket = pd.Series("Missing", index=train.index, dtype="object")
+    bucket.loc[values.eq(0)] = "0"
+    bucket.loc[values.eq(1)] = "1"
+    bucket.loc[values.eq(2)] = "2"
+    bucket.loc[values.ge(3)] = "3+"
+    table = risk_summary(bucket)
+    table.insert(0, "feature", column)
+    inquiry_outputs.append(table)
+inquiry_risk = pd.concat(inquiry_outputs, ignore_index=True)
+display(rounded(inquiry_risk[["feature", "group", "n", "event_rate", "pp_vs_portfolio", "lift"]], 4))
+
+hour_band = pd.cut(train["HOUR_APPR_PROCESS_START"], bins=[-1, 5, 11, 17, 23],
+                   labels=["00–05", "06–11", "12–17", "18–23"])
+weekday_order = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
+timing = (pd.DataFrame({"weekday": train["WEEKDAY_APPR_PROCESS_START"],
+                        "hour_band": hour_band, "TARGET": train["TARGET"]})
+          .groupby(["weekday", "hour_band"], observed=False)
+          .agg(n=("TARGET", "size"), event_rate=("TARGET", "mean"))
+          .reset_index())
+timing_pivot = timing.pivot(index="weekday", columns="hour_band", values="event_rate").reindex(weekday_order)
+sns.heatmap(timing_pivot, annot=True, fmt=".1%", cmap="Blues", cbar_kws={"label": "Event rate"})
+plt.title("Payment-difficulty rate by application timing")
+plt.xlabel("Application hour")
+plt.ylabel("")
+plt.tight_layout()
+plt.show()
+
+contact_cols = ["FLAG_MOBIL", "FLAG_EMP_PHONE", "FLAG_WORK_PHONE", "FLAG_CONT_MOBILE", "FLAG_PHONE", "FLAG_EMAIL"]
+document_cols = [c for c in train.columns if c.startswith("FLAG_DOCUMENT_")]
+flag_rows = []
+for column in contact_cols + document_cols:
+    prevalence = train[column].mean()
+    rate_one = train.loc[train[column].eq(1), "TARGET"].mean()
+    rate_zero = train.loc[train[column].eq(0), "TARGET"].mean()
+    flag_rows.append({"feature": column, "prevalence": prevalence,
+                      "event_rate_when_1": rate_one, "event_rate_when_0": rate_zero,
+                      "pp_difference": 100*(rate_one-rate_zero)})
+flag_risk = pd.DataFrame(flag_rows)
+display(rounded(flag_risk.sort_values("pp_difference", key=abs, ascending=False), 4))
+```
+
+Inquiry windows, timing bands, and operational flags show descriptive differences;
+rare flags are reported with their prevalence so sparse results are not overstated.
+
+## Fairness, redundancy, and robustness
+
+### Q16. Sensitive-group audit
+
+```{python}
+#| label: q16-fairness-audit
+train["_AGE_BAND"] = pd.cut(train["_AGE_YEARS"],
+                            bins=[18, 25, 35, 45, 55, 65, 100],
+                            include_lowest=True,
+                            labels=["18–25", "26–35", "36–45", "46–55", "56–65", "66+"])
+train["_EXT_SOURCES_OBSERVED"] = train[external_cols].notna().sum(axis=1)
+
+def audit_table(group_column):
+    audit = (train.groupby(group_column, dropna=False, observed=False)
+             .agg(n=("TARGET", "size"), bad=("TARGET", "sum"),
+                  event_rate=("TARGET", "mean"),
+                  mean_missing_fields=("_MISSING_COUNT", "mean"),
+                  mean_external_sources_observed=("_EXT_SOURCES_OBSERVED", "mean"),
+                  median_annual_payment_to_income=("_ANNUAL_PAYMENT_TO_INCOME", "median"))
+             .reset_index())
+    audit["population_share"] = audit["n"] / len(train)
+    audit["pp_vs_portfolio"] = 100*(audit["event_rate"] - PORTFOLIO_RATE)
+    return rounded(audit, 4)
+
+display(Markdown("**Gender categories**"))
+display(audit_table("CODE_GENDER"))
+display(Markdown("**Age bands**"))
+display(audit_table("_AGE_BAND"))
+```
+
+Outcome rates and data availability differ across the displayed audit groups.
+Model error-rate and approval-rate gaps remain unavailable until predictions and a
+decision threshold exist.
+
+### Q17. Duplicate and redundant representations
+
+```{python}
+#| label: q17-redundancy
+fingerprints = {}
+for column in train.columns:
+    hashed = pd.util.hash_pandas_object(train[column], index=False).values
+    digest = hashlib.sha1(hashed.tobytes()).hexdigest()
+    fingerprints.setdefault((str(train[column].dtype), digest), []).append(column)
+
+duplicate_groups = []
+for columns in fingerprints.values():
+    if len(columns) > 1:
+        anchor = columns[0]
+        verified = [c for c in columns[1:] if train[anchor].equals(train[c])]
+        if verified:
+            duplicate_groups.append([anchor] + verified)
+display(pd.DataFrame({"exact_duplicate_columns": [", ".join(x) for x in duplicate_groups]}))
+
+numeric_cols = [c for c in train.select_dtypes(include="number").columns
+                if c not in {"SK_ID_CURR", "TARGET"} and not c.startswith("_")]
+numeric_sample = train[numeric_cols].sample(n=min(50_000, len(train)), random_state=42)
+spearman = numeric_sample.corr(method="spearman")
+upper_i, upper_j = np.triu_indices_from(spearman, k=1)
+correlation_pairs = pd.DataFrame({
+    "feature_1": spearman.index[upper_i],
+    "feature_2": spearman.columns[upper_j],
+    "spearman": spearman.values[upper_i, upper_j]
+})
+correlation_pairs["absolute_spearman"] = correlation_pairs["spearman"].abs()
+display(rounded(correlation_pairs.sort_values("absolute_spearman", ascending=False).head(30), 4))
+
+def cramers_v(x, y):
+    x_labels = x.astype("object").where(x.notna(), "Missing")
+    y_labels = y.astype("object").where(y.notna(), "Missing")
+    table = pd.crosstab(x_labels, y_labels)
+    if table.empty or min(table.shape) < 2:
+        return np.nan
+    chi2 = chi2_contingency(table, correction=False)[0]
+    n = table.values.sum()
+    phi2 = chi2/n
+    r, k = table.shape
+    phi2corr = max(0, phi2 - ((k-1)*(r-1))/(n-1))
+    rcorr = r - ((r-1)**2)/(n-1)
+    kcorr = k - ((k-1)**2)/(n-1)
+    denom = min(kcorr-1, rcorr-1)
+    return math.sqrt(phi2corr/denom) if denom > 0 else np.nan
+
+categorical_cols = train.select_dtypes(exclude="number").columns.tolist()
+cat_sample = train[categorical_cols].sample(n=min(100_000, len(train)), random_state=42)
+association_rows = []
+for left, right in itertools.combinations(categorical_cols, 2):
+    association_rows.append({"feature_1": left, "feature_2": right,
+                             "cramers_v": cramers_v(cat_sample[left], cat_sample[right])})
+categorical_association = pd.DataFrame(association_rows).sort_values("cramers_v", ascending=False)
+display(rounded(categorical_association.head(20), 4))
+```
+
+The strongest redundancy is concentrated in repeated property summaries and
+closely related administrative fields. Correlation alone does not decide which
+representation to retain.
+
+### Q18. Development/validation stability
+
+```{python}
+#| label: q18-stability
+dev_index, val_index = train_test_split(
+    train.index, test_size=.20, random_state=42, stratify=train["TARGET"]
+)
+dev = train.loc[dev_index]
+val = train.loc[val_index]
+
+stability_features = [
+    "EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3",
+    "_ANNUAL_PAYMENT_TO_INCOME", "_CREDIT_TO_INCOME",
+    "_AGE_YEARS", "_EMPLOYED_YEARS"
+]
+
+stability_detail = []
+stability_summary = []
+for column in stability_features:
+    observed_dev = dev[column].dropna()
+    _, edges = pd.qcut(observed_dev, q=10, retbins=True, duplicates="drop")
+    edges = np.unique(edges)
+    edges[0], edges[-1] = -np.inf, np.inf
+    dev_group = pd.cut(dev[column], bins=edges, include_lowest=True).astype("object")
+    val_group = pd.cut(val[column], bins=edges, include_lowest=True).astype("object")
+    dev_group = dev_group.where(dev[column].notna(), "Missing")
+    val_group = val_group.where(val[column].notna(), "Missing")
+    dev_rates = (pd.DataFrame({"group": dev_group, "TARGET": dev["TARGET"]})
+                 .groupby("group", sort=False)["TARGET"].agg(dev_n="size", dev_rate="mean"))
+    val_rates = (pd.DataFrame({"group": val_group, "TARGET": val["TARGET"]})
+                 .groupby("group", sort=False)["TARGET"].agg(val_n="size", val_rate="mean"))
+    joined = dev_rates.join(val_rates, how="outer").reset_index()
+    joined.insert(0, "feature", column)
+    joined["pp_gap"] = 100*(joined["val_rate"] - joined["dev_rate"])
+    stability_detail.append(joined)
+    comparable = joined.dropna(subset=["dev_rate", "val_rate"])
+    stability_summary.append({
+        "feature": column,
+        "bins_compared": len(comparable),
+        "max_abs_pp_gap": comparable["pp_gap"].abs().max(),
+        "mean_abs_pp_gap": comparable["pp_gap"].abs().mean(),
+        "rate_rank_correlation": comparable["dev_rate"].corr(comparable["val_rate"], method="spearman")
+    })
+
+stability_detail = pd.concat(stability_detail, ignore_index=True)
+stability_summary = pd.DataFrame(stability_summary)
+display(rounded(stability_summary, 4))
+display(rounded(stability_detail, 4))
+
+income_stability = []
+for name, frame in [("Development", dev), ("Validation", val)]:
+    table = risk_summary(frame["NAME_INCOME_TYPE"], target=frame["TARGET"])
+    table.insert(0, "sample", name)
+    income_stability.append(table)
+display(rounded(pd.concat(income_stability, ignore_index=True)
+                [["sample", "group", "n", "event_rate"]], 4))
+```
+
+The principal numeric risk patterns can be compared using bins defined only on the
+development sample. Sparse categories and larger development/validation gaps are
+flagged for modeling review rather than removed automatically.
+
+## Train/test consistency
+
+The sixth standing check requires `application_test.csv`. It is not executed here
+because this notebook's approved scope is `application_train`. The two files should
+be compared, not joined, in a separate population-shift review.
+
+## What may still be missing?
+
+| Review lens | Remaining question |
+|---|---|
+| Business problem | What are the contribution margin, loss severity, and operational costs needed for a decision threshold? |
+| Dictionary | What exactly are the three external scores, regional ratings, annuity period, and income period? |
+| Standing checks | How do predictor distributions and category levels shift from training to the scoring population? |
+| Underwriting plausibility | Which large income, credit, annuity, family-size, and inquiry values are valid business cases rather than errors? |
+| Fair lending | Which fields are prohibited, sensitive, or unacceptable proxies in the intended jurisdictions? |
+| Sample selection | How were approved applications selected, and what data exist for declined applicants? |
+
+## EDA handoff
+
+Before modeling, the team should approve the feature-availability register, sentinel
+and invalid-value treatments, amount-period assumptions, derived ratio definitions,
+rare-category policy, and fairness-audit fields. The notebook intentionally leaves
+those as governed decisions rather than silently encoding them as preprocessing.

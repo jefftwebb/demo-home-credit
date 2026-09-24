@@ -1,0 +1,219 @@
+---
+title: "Exploratory Data Analysis with AI Assistance"
+subtitle: "MSBA Capstone 1"
+format:
+  revealjs:
+    theme: default
+    transition: fade
+    slide-number: c/t
+    progress: true
+    history: true
+    center: false
+    width: 1150
+    height: 700
+---
+
+## The Challenge
+
+You need to understand a dataset you've never seen:
+
+- Seven tables, 300K+ applications, 120+ columns
+- A data dictionary that is incomplete and sometimes wrong
+- Problems in the data that nobody has told you about
+
+And you're pressed for time.
+
+---
+
+## Consider: What Does AI Change?
+
+Ask yourself where the bottleneck in EDA used to be.
+
+- Without AI: writing the code was the bottleneck
+- With AI: the code is free; the bottleneck is knowing what to ask and what the answer means
+
+The work that remains is judgment. *How should you proceed?*
+
+---
+
+## One Approach
+
+Ask AI: "Do EDA on application_train.csv"
+
+- Forty cells in 30 seconds, but
+- It will answer questions nobody asked---shape, dtypes, missingness bars, a correlation heatmap
+- It will look complete and miss what matters for the lender
+
+---
+
+## A Better Approach
+
+You ask the questions and make the decisions, but use AI as an analyst that will:
+
+- Map the data and research the industry before you touch anything
+- Propose a plan you approve before any code runs
+- Execute one question at a time, then answer: *is there anything you have missed?*
+- Critique your conclusions
+
+Again, a **stage-gated AI workflow**: each stage produces a deliverable that you review (gate) before proceeding.
+
+---
+
+## Where Do the Questions Come From?
+
+Three sources.
+
+1. **Your business problem statement.** Every claim that depends on data is a question to ask.
+2. **Industry research.** What do lenders actually use to assess risk?
+3. **The schema and standing checks.** Every table should prompt a question about grain and joins and data integrity.
+
+
+---
+
+## From Your BPS to Questions
+
+<table style="width: 100%;">
+  <colgroup>
+    <col style="width: 45%;">
+    <col style="width: 55%;">
+  </colgroup>
+  <thead>
+    <tr><th>BPS claim</th><th>EDA question</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>False approvals and false declines have different costs</td><td>What is the cost of those mistakes?</td></tr>
+    <tr><td>Applicants are thin-file; credit history often isn't there</td><td>What share have no bureau record? Do they default differently?</td></tr>
+    <tr><td>Only decision-time information may be used</td><td>Which bureau and prior-application records postdate the application?</td></tr>
+    <tr><td>Decisions must be explainable to a declined applicant</td><td>Which predictive columns are interpretable?</td></tr>
+    <tr><td>
+  </tbody>
+</table>
+
+
+
+---
+
+## From Industry Research to Questions
+
+**Ask AI, with sources:** *What features do consumer lenders rely on to assess repayment risk?*
+
+<table style="width: 100%;">
+  <colgroup>
+    <col style="width: 30%;">
+    <col style="width: 40%;">
+    <col style="width: 30%;">
+  </colgroup>
+  <thead>
+    <tr><th>Industry feature</th><th>Can this data build it?</th><th>EDA question</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Payment-to-income</td><td><code>AMT_ANNUITY / AMT_INCOME_TOTAL</code></td><td>Is income believable? Is the ratio predictive?</td></tr>
+    <tr><td>Loan-to-value</td><td><code>AMT_CREDIT / AMT_GOODS_PRICE</code></td><td>How often is goods price missing? Does LTV > 1 occur?</td></tr>
+  </tbody>
+</table>
+
+Each row is a question now and a feature next week. *AI's memory of Kaggle notebooks is not industry research.*
+
+---
+
+## The Standing Checks
+
+Every EDA, every dataset, whatever the BPS says:
+
+1. Target distribution
+2. Missingness: how much, and does it relate to the target?
+3. Impossible values
+4. Keys, duplicates, and the grain of each table
+5. Temporal direction: what was known at application time?
+6. Train/test consistency in columns and category levels
+
+These open the notebook, before your questions.
+
+---
+
+## Suggested Stage-Gated Workflow
+
+<table style="width: 100%;">
+  <colgroup>
+    <col style="width: 15%;">
+    <col style="width: 35%;">
+    <col style="width: 50%;">
+  </colgroup>
+  <thead>
+    <tr><th>Chat</th><th>Purpose</th><th>Deliverable</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>Learn the data</td><td>Data map</td></tr>
+    <tr><td>2</td><td>Research industry features</td><td>Feature report with sources</td></tr>
+  </tbody>
+</table>
+
+Between Chat 2 and Chat 3: **You write the question list**---from the BPS, the data map, and the feature report.
+
+<table style="width: 100%;">
+  <colgroup>
+    <col style="width: 15%;">
+    <col style="width: 35%;">
+    <col style="width: 50%;">
+  </colgroup>
+  <tbody>
+    <tr><td>3</td><td>Plan</td><td>Approved EDA plan</td></tr>
+    <tr><td>4</td><td>Execute</td><td>Draft notebook (code + output), closed with *"Is there anything you have missed?"*</td></tr>
+  </tbody>
+</table>
+
+Between Chat 4 and Chat 5: **You write the interpretations and decisions.**
+
+<table style="width: 100%;">
+  <colgroup>
+    <col style="width: 15%;">
+    <col style="width: 35%;">
+    <col style="width: 50%;">
+  </colgroup>
+  <tbody>
+    <tr><td>5</td><td>Adversarial critique</td><td>Final notebook</td></tr>
+  </tbody>
+</table>
+
+---
+
+## Chat 1: Learn the data --> data map
+
+"Read the data dictionary in docs/ and the CSVs in data/raw/. Do not do EDA. For each table, report: (1) the grain — what one row represents — and the row count; (2) the primary key and whether it is unique; (3) foreign keys, the table they join to, and the cardinality; (4) the share of application_train applicants with at least one row; (5) any column whose values contradict the dictionary. Write the result to docs/data/data-map.md."
+
+---
+
+## Chat 2: Research industry features --> feature report
+
+"What features do consumer lenders use to assess repayment risk for thin-file applicants? Cite sources — regulator guidance, lender disclosures, or peer-reviewed work; not Kaggle notebooks or blog posts. Then read docs/data/data-map.md and, for each feature, state whether this data can build it, with the exact columns and tables, or why it cannot. Write to docs/research/feature-report.md. Do not compute anything."
+
+## Chat 3: Plan --> EDA plan
+
+"Here is my question list. First, check it against the six standing checks; for any check not covered, add a question and mark it [added]. Then, for each question, propose the method, the tables needed, and what the output will look like. Order the questions so that nothing depends on a result that comes later. Flag any question this data cannot answer and any that is description rather than a question. Write the plan to docs/planning/eda-plan.md. Do not run code until I approve it."
+
+## Chat 4: Execute --> draft notebook
+
+"Execute docs/planning/eda-plan.md in notebooks/01_eda.qmd. Open with a "Standing checks" section, one subsection per check, then one section per question in the approved order. For each: the question as a heading, the code, the output, and one sentence stating what the output shows — no interpretation of what it means. Stop and ask if a result makes a later question moot. When finished: is there anything you have missed --- against the BPS, the dictionary, the six standing checks, and what an underwriter would refuse to believe? Add those as a final section."
+
+## "Is There Anything You Have Missed?"
+
+Before you write any interpretation:
+
+- *Against the BPS:* which claims did we not test?
+- *Against the dictionary:* which columns contradict their definitions?
+- *Against the standing checks:* which of the six did we skip or do shallowly?
+- *Against a lender:* which values would an underwriter refuse to believe?
+
+
+---
+
+## Chat 5: Adversarial critique --> final notebook
+
+After writing your interpretations of results in the notebook:
+
+"Read notebooks/01_eda.qmd and my interpretations and decisions in decisions.md. For each decision, argue against it: what in the notebook contradicts it, what was never checked, and what a skeptical credit-risk reviewer would ask. Then check each question in questions.md was actually answered. Do not soften the critique and do not change any decision — list the objections and let me rule on them."
+
+
+## Demo
+
+Go to Positron ...
